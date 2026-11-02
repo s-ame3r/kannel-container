@@ -1,0 +1,22 @@
+services:
+  kannel:
+    build: .
+    container_name: kannel
+    restart: unless-stopped
+    ports:
+      - "10000:10000" # fake SMSC 0
+      - "10001:10001" # fake SMSC 1
+      - "10002:10002" # fake SMSC 2
+      - "10003:10003" # fake SMSC 3
+      - "10004:10004" # fake SMSC 4
+      - "12000:12000" # admin / status
+      - "12013:12013" # sendsms API
+    volumes:
+      - ./kannel.conf:/etc/kannel/kannel.conf:ro
+      - ./smsc.d:/etc/kannel/smsc.d:ro
+      - kannel-logs:/var/log/kannel
+      - kannel-spool:/var/spool/kannel
+
+volumes:
+  kannel-logs:
+  kannel-spool:
