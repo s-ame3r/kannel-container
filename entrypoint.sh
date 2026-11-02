@@ -6,7 +6,6 @@ FAKESMSC_BIN="/usr/lib/kannel/test/fakesmsc"
 
 # ------------------------------------------------------------------
 # Wait for a TCP port to accept connections (bash built-in /dev/tcp)
-# Never exits with failure — only prints a warning on timeout.
 # ------------------------------------------------------------------
 wait_for_port() {
     local port=$1
@@ -25,41 +24,45 @@ wait_for_port() {
 }
 
 start_fakesmsc() {
-    # -m -1  = unlimited messages (run forever)
-    # -i 1   = 1 second interval between generated MO messages
-    # -H/-r  = connect to bearerbox's fake SMSC listener (bearerbox is server)
-    # msg arg is required or fakesmsc panics and exits immediately
     echo "[entrypoint] Starting fakesmsc -> localhost:10000"
-    "$FAKESMSC_BIN"  -r 10000 &
+    # Redirect stdin from /dev/null so fakesmsc never enters interactive mode.
+    # -m -1  : unlimited messages (run forever)
+    # -i 60  : send one MO message every 60s (just a keepalive)
+    # last arg is the message: "sender receiver type data"
+    "$FAKESMSC_BIN" -H localhost -r 10000 -m -1 -i 60 "000 111 text nop" </dev/null &
     FS_PID=$!
     echo "[entrypoint] fakesmsc started (PID $FS_PID)"
+    sleep 1
+    if kill -0 "$FS_PID" 2>/dev/null; then
+        echo "[entrypoint] fakesmsc is running OK"
+    else
+        echo "[entrypoint] ERROR: fakesmsc exited immediately"
+    fi
 }
 
 # ------------------------------------------------------------------
-# 1. Start bearerbox — listens on port 10000 (fake SMSC server)
-#    and port 12001 (smsbox connections)
+# 1. Start bearerbox
 # ------------------------------------------------------------------
 echo "[entrypoint] Starting bearerbox"
-bearerbox "$CONF" &
+bearerbox "$CONF" </dev/null &
 BB_PID=$!
 echo "[entrypoint] bearerbox started (PID $BB_PID)"
 
-# Wait for bearerbox to open both its ports before proceeding
 wait_for_port 10000 30
 wait_for_port 12001 30
 
 # ------------------------------------------------------------------
-# 2. Start smsbox — connects to bearerbox on port 12001
+# 2. Start smsbox
 # ------------------------------------------------------------------
 echo "[entrypoint] Starting smsbox"
-smsbox "$CONF" &
+smsbox "$CONF" </dev/null &
 SB_PID=$!
 echo "[entrypoint] smsbox started (PID $SB_PID)"
 
 sleep 2
 
 # ------------------------------------------------------------------
-# 3. Start fakesmsc — connects to bearerbox on port 10000
+# 3. Start fakesmsc
 # ------------------------------------------------------------------
 start_fakesmsc
 
@@ -76,17 +79,16 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 # ------------------------------------------------------------------
-# 5. Monitor loop — restart fakesmsc if it exits;
-#    exit container if bearerbox or smsbox die
+# 5. Monitor loop
 # ------------------------------------------------------------------
 while true; do
     if ! kill -0 "$BB_PID" 2>/dev/null; then
-        echo "[entrypoint] bearerbox (PID $BB_PID) exited unexpectedly!"
+        echo "[entrypoint] bearerbox exited unexpectedly!"
         cleanup
         exit 1
     fi
     if ! kill -0 "$SB_PID" 2>/dev/null; then
-        echo "[entrypoint] smsbox (PID $SB_PID) exited unexpectedly!"
+        echo "[entrypoint] smsbox exited unexpectedly!"
         cleanup
         exit 1
     fi
