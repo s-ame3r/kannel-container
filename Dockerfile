@@ -12,10 +12,9 @@ RUN apt-get update \
 # Application files
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY kannel.conf /etc/kannel/kannel.conf
-COPY smsc.d /etc/kannel/smsc.d
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && chown -R kannel:kannel /etc/kannel/kannel.conf /etc/kannel/smsc.d
+    && chown kannel:kannel /etc/kannel/kannel.conf
 
 # Expose ports
 # 10000-10004 = fake SMSC, 12000 = admin/status, 12013 = send-sms HTTP API
