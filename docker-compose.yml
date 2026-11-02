@@ -1,6 +1,10 @@
 services:
   kannel:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kannel:local
+    pull_policy: build
     container_name: kannel
     restart: unless-stopped
     ports:
@@ -13,7 +17,6 @@ services:
       - "12013:12013" # sendsms API
     volumes:
       - ./kannel.conf:/etc/kannel/kannel.conf:ro
-      - ./smsc.d:/etc/kannel/smsc.d:ro
       - kannel-logs:/var/log/kannel
       - kannel-spool:/var/spool/kannel
 
