@@ -6,8 +6,7 @@ FAKESMSC_BIN="/usr/lib/kannel/test/fakesmsc"
 
 # ------------------------------------------------------------------
 # Wait for a TCP port to accept connections (bash built-in /dev/tcp)
-# Usage: wait_for_port <port> <max_seconds>
-# Returns 0 on success, 1 on timeout (does NOT exit the script)
+# Never exits with failure — only prints a warning on timeout.
 # ------------------------------------------------------------------
 wait_for_port() {
     local port=$1
@@ -16,56 +15,60 @@ wait_for_port() {
     echo "[entrypoint] Waiting for port $port (up to ${max}s)..."
     while [ $i -lt $max ]; do
         if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
-            echo "[entrypoint] Port $port is ready (${i}s elapsed)"
+            echo "[entrypoint] Port $port ready after ${i}s"
             return 0
         fi
         sleep 1
         i=$((i + 1))
     done
     echo "[entrypoint] WARNING: port $port not ready after ${max}s, continuing anyway"
-    return 0
+}
+
+start_fakesmsc() {
+    # -m -1  = unlimited messages (run forever)
+    # -i 1   = 1 second interval between generated MO messages
+    # -H/-r  = connect to bearerbox's fake SMSC listener (bearerbox is server)
+    # msg arg is required or fakesmsc panics and exits immediately
+    echo "[entrypoint] Starting fakesmsc -> localhost:10000"
+    "$FAKESMSC_BIN"  -r 10000 &
+    FS_PID=$!
+    echo "[entrypoint] fakesmsc started (PID $FS_PID)"
 }
 
 # ------------------------------------------------------------------
-# 1. Start fakesmsc FIRST
-#    - no args = listens on port 10000
-#    - -m -1   = never exit (handle unlimited messages)
-#    bearerbox (smsc=fake) connects TO fakesmsc as a client
-# ------------------------------------------------------------------
-echo "[entrypoint] Starting fakesmsc (listening on port 10000)"
-"$FAKESMSC_BIN" -m -1 &
-FS_PID=$!
-echo "[entrypoint] fakesmsc started (PID $FS_PID)"
-
-# Give fakesmsc time to open its listener before bearerbox connects
-wait_for_port 10000 15
-
-# ------------------------------------------------------------------
-# 2. Start bearerbox — reads config and connects to fakesmsc:10000
+# 1. Start bearerbox — listens on port 10000 (fake SMSC server)
+#    and port 12001 (smsbox connections)
 # ------------------------------------------------------------------
 echo "[entrypoint] Starting bearerbox"
 bearerbox "$CONF" &
 BB_PID=$!
 echo "[entrypoint] bearerbox started (PID $BB_PID)"
 
-# Wait for bearerbox to open admin port (12000) and smsbox port (12001)
-wait_for_port 12000 30
+# Wait for bearerbox to open both its ports before proceeding
+wait_for_port 10000 30
 wait_for_port 12001 30
 
 # ------------------------------------------------------------------
-# 3. Start smsbox — connects to bearerbox on port 12001
+# 2. Start smsbox — connects to bearerbox on port 12001
 # ------------------------------------------------------------------
 echo "[entrypoint] Starting smsbox"
 smsbox "$CONF" &
 SB_PID=$!
 echo "[entrypoint] smsbox started (PID $SB_PID)"
 
+sleep 2
+
+# ------------------------------------------------------------------
+# 3. Start fakesmsc — connects to bearerbox on port 10000
+# ------------------------------------------------------------------
+start_fakesmsc
+
 # ------------------------------------------------------------------
 # 4. Cleanup handler
 # ------------------------------------------------------------------
 cleanup() {
     echo "[entrypoint] Shutting down..."
-    kill -TERM "$SB_PID" "$BB_PID" "$FS_PID" 2>/dev/null || true
+    kill -TERM "$FS_PID" "$SB_PID" "$BB_PID" 2>/dev/null || true
     wait "$BB_PID" 2>/dev/null || true
     echo "[entrypoint] Done."
 }
@@ -73,8 +76,8 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 # ------------------------------------------------------------------
-# 5. Monitor loop — restart fakesmsc if it dies;
-#    exit the container if bearerbox or smsbox die
+# 5. Monitor loop — restart fakesmsc if it exits;
+#    exit container if bearerbox or smsbox die
 # ------------------------------------------------------------------
 while true; do
     if ! kill -0 "$BB_PID" 2>/dev/null; then
@@ -88,10 +91,8 @@ while true; do
         exit 1
     fi
     if ! kill -0 "$FS_PID" 2>/dev/null; then
-        echo "[entrypoint] fakesmsc died, restarting..."
-        "$FAKESMSC_BIN" -m -1 &
-        FS_PID=$!
-        echo "[entrypoint] fakesmsc restarted (PID $FS_PID)"
+        echo "[entrypoint] fakesmsc exited, restarting..."
+        start_fakesmsc
     fi
     sleep 3
 done
