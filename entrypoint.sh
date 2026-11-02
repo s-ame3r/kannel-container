@@ -2,6 +2,7 @@
 set -e
 
 CONF=/etc/kannel/kannel.conf
+FAKESMSC_BIN="/usr/lib/kannel/test/fakesmsc"
 
 # ------------------------------------------------------------------
 # 1. Start bearerbox
@@ -10,8 +11,17 @@ bearerbox -v 2 "$CONF" &
 BB_PID=$!
 echo "[entrypoint] bearerbox started (PID $BB_PID)"
 
-# Give bearerbox time to open its smsbox port and fake SMSC ports
-sleep 3
+# Wait until bearerbox is actually listening on the fake SMSC port (10000)
+echo "[entrypoint] Waiting for bearerbox to open port 10000..."
+for i in $(seq 1 30); do
+    if ss -ltn 2>/dev/null | grep -q ':10000 ' || \
+       cat /proc/net/tcp6 2>/dev/null | awk '{print $2}' | grep -qi "$(printf '%04X' 10000)$" || \
+       cat /proc/net/tcp 2>/dev/null | awk '{print $2}' | grep -qi "$(printf '%04X' 10000)$"; then
+        echo "[entrypoint] Port 10000 is open (attempt $i)"
+        break
+    fi
+    sleep 1
+done
 
 # ------------------------------------------------------------------
 # 2. Start smsbox
@@ -23,34 +33,19 @@ echo "[entrypoint] smsbox started (PID $SB_PID)"
 sleep 2
 
 # ------------------------------------------------------------------
-# 3. Start fakesmsc instances (one per port, stay alive with -m -1)
+# 3. Start fakesmsc (connects to bearerbox on port 10000)
 # ------------------------------------------------------------------
-START_FAKESMSC="${START_FAKESMSC:-true}"
-FAKESMSC_PORTS="${FAKESMSC_PORTS:-10000 10001 10002 10003 10004}"
-FAKESMSC_HOST="${FAKESMSC_HOST:-localhost}"
-FAKESMSC_BIN="$(command -v fakesmsc 2>/dev/null || echo '/usr/lib/kannel/test/fakesmsc')"
-FS_PIDS=()
-
-if [ "$START_FAKESMSC" = "true" ] && [ -x "$FAKESMSC_BIN" ]; then
-    for port in $FAKESMSC_PORTS; do
-        echo "[entrypoint] Starting fakesmsc -> $FAKESMSC_HOST:$port"
-        # -m -1 = run indefinitely (never exit after N messages)
-        "$FAKESMSC_BIN" -v 0 -H "$FAKESMSC_HOST" -r "$port" -m -1 &
-        FS_PIDS+=($!)
-    done
-elif [ "$START_FAKESMSC" = "true" ]; then
-    echo "[entrypoint] WARNING: fakesmsc not found at $FAKESMSC_BIN, skipping"
-fi
+echo "[entrypoint] Starting fakesmsc -> localhost:10000"
+"$FAKESMSC_BIN" -r 10000 &
+FS_PID=$!
+echo "[entrypoint] fakesmsc started (PID $FS_PID)"
 
 # ------------------------------------------------------------------
 # 4. Cleanup handler
 # ------------------------------------------------------------------
 cleanup() {
     echo "[entrypoint] Caught signal, shutting down..."
-    kill -TERM "$BB_PID" "$SB_PID" 2>/dev/null || true
-    if [ ${#FS_PIDS[@]} -gt 0 ]; then
-        kill -TERM "${FS_PIDS[@]}" 2>/dev/null || true
-    fi
+    kill -TERM "$FS_PID" "$SB_PID" "$BB_PID" 2>/dev/null || true
     wait "$BB_PID" "$SB_PID" 2>/dev/null || true
     echo "[entrypoint] Done."
 }
@@ -70,6 +65,13 @@ while true; do
         echo "[entrypoint] smsbox (PID $SB_PID) exited unexpectedly!"
         cleanup
         exit 1
+    fi
+    # Restart fakesmsc if it dies
+    if ! kill -0 "$FS_PID" 2>/dev/null; then
+        echo "[entrypoint] fakesmsc died, restarting..."
+        "$FAKESMSC_BIN" -r 10000 &
+        FS_PID=$!
+        echo "[entrypoint] fakesmsc restarted (PID $FS_PID)"
     fi
     sleep 2
 done
