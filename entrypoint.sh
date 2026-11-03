@@ -29,7 +29,7 @@ start_fakesmsc() {
     # -m -1  : unlimited messages (run forever)
     # -i 60  : send one MO message every 60s (just a keepalive)
     # last arg is the message: "sender receiver type data"
-    "$FAKESMSC_BIN" -H localhost -r 10000 -m -1 -i 60 "000 111 text nop" </dev/null &
+    "$FAKESMSC_BIN" -H localhost -r 10000 -m 0 "000 111 text nop" </dev/null &
     FS_PID=$!
     echo "[entrypoint] fakesmsc started (PID $FS_PID)"
     sleep 1
