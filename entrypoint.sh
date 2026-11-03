@@ -2,74 +2,99 @@
 set -e
 
 CONF=/etc/kannel/kannel.conf
+FAKESMSC_BIN="/usr/lib/kannel/test/fakesmsc"
+
+# ------------------------------------------------------------------
+# Wait for a TCP port to accept connections (bash built-in /dev/tcp)
+# ------------------------------------------------------------------
+wait_for_port() {
+    local port=$1
+    local max=$2
+    local i=0
+    echo "[entrypoint] Waiting for port $port (up to ${max}s)..."
+    while [ $i -lt $max ]; do
+        if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+            echo "[entrypoint] Port $port ready after ${i}s"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "[entrypoint] WARNING: port $port not ready after ${max}s, continuing anyway"
+}
+
+start_fakesmsc() {
+    echo "[entrypoint] Starting fakesmsc -> localhost:10000"
+    # Redirect stdin from /dev/null so fakesmsc never enters interactive mode.
+    # -m -1  : unlimited messages (run forever)
+    # -i 60  : send one MO message every 60s (just a keepalive)
+    # last arg is the message: "sender receiver type data"
+    "$FAKESMSC_BIN" -H localhost -r 10000 -m -1 -i 60 "000 111 text nop" </dev/null &
+    FS_PID=$!
+    echo "[entrypoint] fakesmsc started (PID $FS_PID)"
+    sleep 1
+    if kill -0 "$FS_PID" 2>/dev/null; then
+        echo "[entrypoint] fakesmsc is running OK"
+    else
+        echo "[entrypoint] ERROR: fakesmsc exited immediately"
+    fi
+}
 
 # ------------------------------------------------------------------
 # 1. Start bearerbox
 # ------------------------------------------------------------------
-bearerbox -v 2 "$CONF" &
+echo "[entrypoint] Starting bearerbox"
+bearerbox "$CONF" </dev/null &
 BB_PID=$!
 echo "[entrypoint] bearerbox started (PID $BB_PID)"
 
-# Give bearerbox time to open its smsbox port and fake SMSC ports
-sleep 3
+wait_for_port 10000 30
+wait_for_port 12001 30
 
 # ------------------------------------------------------------------
 # 2. Start smsbox
 # ------------------------------------------------------------------
-smsbox -v 2 "$CONF" &
+echo "[entrypoint] Starting smsbox"
+smsbox "$CONF" </dev/null &
 SB_PID=$!
 echo "[entrypoint] smsbox started (PID $SB_PID)"
 
 sleep 2
 
 # ------------------------------------------------------------------
-# 3. Start fakesmsc instances (one per port, stay alive with -m -1)
+# 3. Start fakesmsc
 # ------------------------------------------------------------------
-START_FAKESMSC="${START_FAKESMSC:-true}"
-FAKESMSC_PORTS="${FAKESMSC_PORTS:-10000 10001 10002 10003 10004}"
-FAKESMSC_HOST="${FAKESMSC_HOST:-localhost}"
-FAKESMSC_BIN="$(command -v fakesmsc 2>/dev/null || echo '/usr/lib/kannel/test/fakesmsc')"
-FS_PIDS=()
-
-if [ "$START_FAKESMSC" = "true" ] && [ -x "$FAKESMSC_BIN" ]; then
-    for port in $FAKESMSC_PORTS; do
-        echo "[entrypoint] Starting fakesmsc -> $FAKESMSC_HOST:$port"
-        # -m -1 = run indefinitely (never exit after N messages)
-        "$FAKESMSC_BIN" -v 0 -H "$FAKESMSC_HOST" -r "$port" -m -1 &
-        FS_PIDS+=($!)
-    done
-elif [ "$START_FAKESMSC" = "true" ]; then
-    echo "[entrypoint] WARNING: fakesmsc not found at $FAKESMSC_BIN, skipping"
-fi
+start_fakesmsc
 
 # ------------------------------------------------------------------
 # 4. Cleanup handler
 # ------------------------------------------------------------------
 cleanup() {
-    echo "[entrypoint] Caught signal, shutting down..."
-    kill -TERM "$BB_PID" "$SB_PID" 2>/dev/null || true
-    if [ ${#FS_PIDS[@]} -gt 0 ]; then
-        kill -TERM "${FS_PIDS[@]}" 2>/dev/null || true
-    fi
-    wait "$BB_PID" "$SB_PID" 2>/dev/null || true
+    echo "[entrypoint] Shutting down..."
+    kill -TERM "$FS_PID" "$SB_PID" "$BB_PID" 2>/dev/null || true
+    wait "$BB_PID" 2>/dev/null || true
     echo "[entrypoint] Done."
 }
 
 trap cleanup SIGTERM SIGINT
 
 # ------------------------------------------------------------------
-# 5. Monitor: exit if bearerbox or smsbox dies
+# 5. Monitor loop
 # ------------------------------------------------------------------
 while true; do
     if ! kill -0 "$BB_PID" 2>/dev/null; then
-        echo "[entrypoint] bearerbox (PID $BB_PID) exited unexpectedly!"
+        echo "[entrypoint] bearerbox exited unexpectedly!"
         cleanup
         exit 1
     fi
     if ! kill -0 "$SB_PID" 2>/dev/null; then
-        echo "[entrypoint] smsbox (PID $SB_PID) exited unexpectedly!"
+        echo "[entrypoint] smsbox exited unexpectedly!"
         cleanup
         exit 1
     fi
-    sleep 2
+    if ! kill -0 "$FS_PID" 2>/dev/null; then
+        echo "[entrypoint] fakesmsc exited, restarting..."
+        start_fakesmsc
+    fi
+    sleep 3
 done
