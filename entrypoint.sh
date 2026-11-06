@@ -28,21 +28,22 @@ wait_for_port() {
 # -m 0        : send zero generated messages (connection-only, no traffic)
 # </dev/null  : prevent interactive mode (fakesmsc reads stdin otherwise)
 start_fakesmsc() {
-    declare -gA FS_PIDS
     for port in $FAKESMSC_PORTS; do
         echo "[entrypoint] Starting fakesmsc -> localhost:$port"
         "$FAKESMSC_BIN" -H localhost -r "$port" -m 0 "000 111 text nop" </dev/null &
-        FS_PIDS[$port]=$!
-        echo "[entrypoint] fakesmsc:$port started (PID ${FS_PIDS[$port]})"
+        eval "FS_PID_${port}=$!"
+        echo "[entrypoint] fakesmsc:$port started (PID $!)"
     done
     sleep 1
     for port in $FAKESMSC_PORTS; do
-        if kill -0 "${FS_PIDS[$port]}" 2>/dev/null; then
+        pid=$(eval "echo \$FS_PID_${port}")
+        if kill -0 "$pid" 2>/dev/null; then
             echo "[entrypoint] fakesmsc:$port is running OK"
         else
             echo "[entrypoint] ERROR: fakesmsc:$port exited immediately"
         fi
     done
+}   done
 }
 
 # ------------------------------------------------------------------
@@ -80,7 +81,8 @@ start_fakesmsc
 cleanup() {
     echo "[entrypoint] Shutting down..."
     for port in $FAKESMSC_PORTS; do
-        kill -TERM "${FS_PIDS[$port]}" 2>/dev/null || true
+        pid=$(eval "echo \$FS_PID_${port}")
+        kill -TERM "$pid" 2>/dev/null || true
     done
     kill -TERM "$SB_PID" "$BB_PID" 2>/dev/null || true
     wait "$BB_PID" 2>/dev/null || true
@@ -105,11 +107,12 @@ while true; do
         exit 1
     fi
     for port in $FAKESMSC_PORTS; do
-        if ! kill -0 "${FS_PIDS[$port]}" 2>/dev/null; then
+        pid=$(eval "echo \$FS_PID_${port}")
+        if ! kill -0 "$pid" 2>/dev/null; then
             echo "[entrypoint] fakesmsc:$port exited, restarting..."
             "$FAKESMSC_BIN" -H localhost -r "$port" -m 0 "000 111 text nop" </dev/null &
-            FS_PIDS[$port]=$!
-            echo "[entrypoint] fakesmsc:$port restarted (PID ${FS_PIDS[$port]})"
+            eval "FS_PID_${port}=$!"
+            echo "[entrypoint] fakesmsc:$port restarted (PID $!)"
         fi
     done
     sleep 3
