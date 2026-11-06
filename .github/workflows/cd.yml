@@ -1,0 +1,69 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -e
+            cd /opt/scripts/kannel-container
+
+            echo "=== Pulling latest main ==="
+            git fetch origin main
+            git checkout main
+            git pull origin main
+
+            echo "=== Rebuilding container ==="
+            docker compose down
+            docker compose build --no-cache
+            docker compose up -d
+
+            echo "=== Waiting for healthy state ==="
+            for i in $(seq 1 24); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' kannel 2>/dev/null || echo "unknown")
+              echo "  Attempt $i: $STATUS"
+              if [ "$STATUS" = "healthy" ]; then
+                echo "Container is healthy!"
+                break
+              fi
+              if [ $i -eq 24 ]; then
+                echo "ERROR: Container did not become healthy after deploy"
+                docker logs --tail 50 kannel
+                exit 1
+              fi
+              sleep 5
+            done
+
+            echo "=== Post-deploy smoke test ==="
+            RESPONSE=$(curl -sf "http://localhost:12000/status?password=foobar")
+            echo "$RESPONSE" | grep -q "Status: running" || { echo "ERROR: bearerbox not running after deploy"; exit 1; }
+            echo "$RESPONSE" | grep -q "smsbox:WebAPI"   || { echo "ERROR: smsbox not connected after deploy"; exit 1; }
+
+            ALL_OK=true
+            for smsc in FAKE1 FAKE2 FAKE3 FAKE4 FAKE5; do
+              if echo "$RESPONSE" | grep -q "${smsc}\[${smsc}\].*online"; then
+                echo "OK: $smsc online"
+              else
+                echo "ERROR: $smsc NOT online after deploy"
+                ALL_OK=false
+              fi
+            done
+            $ALL_OK || { docker logs --tail 50 kannel; exit 1; }
+
+            echo "=== Deploy complete ==="

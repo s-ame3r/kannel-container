@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - feature
+  pull_request:
+    branches:
+      - staging
+      - main
+
+jobs:
+  lint-and-validate:
+    name: Lint & Validate Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate kannel.conf syntax
+        run: |
+          echo "=== Checking kannel.conf ==="
+          # Must have a core group
+          grep -q "^group = core" kannel.conf || { echo "ERROR: missing 'group = core' in kannel.conf"; exit 1; }
+          # Must have admin-port
+          grep -q "^admin-port" kannel.conf || { echo "ERROR: missing admin-port in kannel.conf"; exit 1; }
+          # Must have smsbox-port
+          grep -q "^smsbox-port" kannel.conf || { echo "ERROR: missing smsbox-port in kannel.conf"; exit 1; }
+          echo "kannel.conf looks valid"
+
+      - name: Validate smsc.d configs
+        run: |
+          echo "=== Checking smsc.d/ ==="
+          if [ ! -d smsc.d ] || [ -z "$(ls smsc.d/*.conf 2>/dev/null)" ]; then
+            echo "ERROR: smsc.d/ is empty or missing .conf files"
+            exit 1
+          fi
+          for f in smsc.d/*.conf; do
+            echo "Checking $f..."
+            grep -q "^group = smsc" "$f"   || { echo "ERROR: $f missing 'group = smsc'"; exit 1; }
+            grep -q "^smsc-id"      "$f"   || { echo "ERROR: $f missing 'smsc-id'"; exit 1; }
+            grep -q "^port"         "$f"   || { echo "ERROR: $f missing 'port'"; exit 1; }
+          done
+          echo "All smsc.d configs look valid"
+
+      - name: Validate include paths in kannel.conf
+        run: |
+          echo "=== Checking include directives ==="
+          grep "^include" kannel.conf | while read -r line; do
+            # Extract the path between quotes
+            path=$(echo "$line" | grep -oP '(?<=")[^"]+(?=")')
+            # Strip /etc/kannel/ prefix and check locally
+            local_path=$(echo "$path" | sed 's|/etc/kannel/||')
+            if [ ! -f "$local_path" ]; then
+              echo "ERROR: included file '$local_path' does not exist in repo"
+              exit 1
+            fi
+            echo "OK: $local_path exists"
+          done
+
+      - name: Validate entrypoint.sh
+        run: |
+          echo "=== Checking entrypoint.sh ==="
+          bash -n entrypoint.sh || { echo "ERROR: entrypoint.sh has syntax errors"; exit 1; }
+          grep -q "fakesmsc" entrypoint.sh || { echo "ERROR: entrypoint.sh does not start fakesmsc"; exit 1; }
+          grep -q "bearerbox" entrypoint.sh || { echo "ERROR: entrypoint.sh does not start bearerbox"; exit 1; }
+          grep -q "smsbox" entrypoint.sh    || { echo "ERROR: entrypoint.sh does not start smsbox"; exit 1; }
+          echo "entrypoint.sh looks valid"
+
+      - name: Validate Dockerfile
+        run: |
+          echo "=== Checking Dockerfile ==="
+          grep -q "^FROM" Dockerfile         || { echo "ERROR: Dockerfile missing FROM"; exit 1; }
+          grep -q "COPY entrypoint.sh" Dockerfile || { echo "ERROR: Dockerfile missing COPY entrypoint.sh"; exit 1; }
+          grep -q "COPY kannel.conf"   Dockerfile || { echo "ERROR: Dockerfile missing COPY kannel.conf"; exit 1; }
+          grep -q "COPY smsc.d"        Dockerfile || { echo "ERROR: Dockerfile missing COPY smsc.d"; exit 1; }
+          grep -q "ENTRYPOINT"         Dockerfile || { echo "ERROR: Dockerfile missing ENTRYPOINT"; exit 1; }
+          echo "Dockerfile looks valid"
+
+  build-and-test:
+    name: Build & Integration Test
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker compose build --no-cache
+
+      - name: Start container
+        run: docker compose up -d
+
+      - name: Wait for container to be healthy
+        run: |
+          echo "Waiting for kannel to become healthy..."
+          for i in $(seq 1 24); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' kannel 2>/dev/null || echo "unknown")
+            echo "  Attempt $i: $STATUS"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Container is healthy!"
+              break
+            fi
+            if [ $i -eq 24 ]; then
+              echo "ERROR: Container did not become healthy within 120s"
+              docker logs kannel
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Check bearerbox status endpoint
+        run: |
+          echo "=== Querying bearerbox status ==="
+          RESPONSE=$(curl -sf "http://localhost:12000/status?password=foobar")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q "Status: running" || { echo "ERROR: bearerbox not running"; exit 1; }
+          echo "$RESPONSE" | grep -q "smsbox:WebAPI"   || { echo "ERROR: smsbox WebAPI not connected"; exit 1; }
+
+      - name: Check all SMSCs are online
+        run: |
+          echo "=== Checking SMSC connections ==="
+          RESPONSE=$(curl -sf "http://localhost:12000/status?password=foobar")
+          ALL_OK=true
+          for smsc in FAKE1 FAKE2 FAKE3 FAKE4 FAKE5; do
+            if echo "$RESPONSE" | grep -q "${smsc}\[${smsc}\].*online"; then
+              echo "OK: $smsc is online"
+            else
+              echo "ERROR: $smsc is NOT online"
+              ALL_OK=false
+            fi
+          done
+          $ALL_OK || { echo "One or more SMSCs failed"; docker logs kannel; exit 1; }
+
+      - name: Test sendsms API
+        run: |
+          echo "=== Testing sendsms API ==="
+          RESULT=$(curl -sf \
+            "http://localhost:12013/cgi-bin/sendsms?username=CMS-Send&password=hyT67Rq&from=100&to=2121&text=CItest&smsc=FAKE1")
+          echo "Response: $RESULT"
+          echo "$RESULT" | grep -q "Accepted" || { echo "ERROR: sendsms did not return Accepted"; exit 1; }
+          echo "sendsms API OK"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs kannel
+
+      - name: Teardown
+        if: always()
+        run: docker compose down
