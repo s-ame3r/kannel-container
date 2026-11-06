@@ -1,0 +1,61 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -e
+            cd /opt/scripts/kannel-container
+
+            echo "=== Pulling latest main ==="
+            git fetch origin main
+            git checkout main
+            git pull origin main
+
+            echo "=== Rebuilding ==="
+            docker compose down
+            docker compose build --no-cache
+            docker compose up -d
+
+            echo "=== Waiting for healthy ==="
+            for i in $(seq 1 24); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' kannel 2>/dev/null || echo "unknown")
+              echo "  [$i/24] $STATUS"
+              [ "$STATUS" = "healthy" ] && { echo "Healthy!"; break; }
+              [ $i -eq 24 ] && { echo "ERROR: not healthy after deploy"; docker logs --tail 50 kannel; exit 1; }
+              sleep 5
+            done
+
+            echo "=== Smoke test ==="
+            RESP=$(curl -sf "http://localhost:12000/status?password=foobar")
+            echo "$RESP" | grep -q "Status: running" || { echo "ERROR: bearerbox down"; exit 1; }
+            echo "$RESP" | grep -q "smsbox:WebAPI"   || { echo "ERROR: smsbox not connected"; exit 1; }
+            FAIL=0
+            for smsc in FAKE1 FAKE2 FAKE3 FAKE4 FAKE5; do
+              if echo "$RESP" | grep -q "${smsc}\[${smsc}\].*online"; then
+                echo "OK: $smsc online"
+              else
+                echo "FAIL: $smsc not online"
+                FAIL=1
+              fi
+            done
+            [ $FAIL -eq 0 ] || { docker logs --tail 50 kannel; exit 1; }
+
+            echo "=== Deploy complete ==="
